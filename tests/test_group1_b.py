@@ -1,0 +1,329 @@
+"""Offline unit tests for Group 1 B-side components.
+
+All network calls are mocked; these tests run without internet access and
+cover the acceptance criteria in docs/API_CONTRACTS.md: empty results, field
+missing, illegal dates, rate limits, timeouts.
+"""
+
+import asyncio
+import json
+import unittest
+from unittest import mock
+
+import requests
+
+from paper_agent.adapters._concept_extraction import HeuristicConceptExtractor
+from paper_agent.adapters._retriever_utils import (
+    ProviderRateLimitedError,
+    ProviderResponseError,
+    ProviderTimeoutError,
+    ProviderUnavailableError,
+    http_get_json,
+    normalize_doi,
+    parse_date,
+    parse_year,
+    restore_abstract_from_inverted_index,
+)
+from paper_agent.adapters.crossref_retriever import CrossrefRetriever, _strip_jats
+from paper_agent.adapters.llm_concept_extractor import LLMConceptExtractor
+from paper_agent.adapters.openalex_retriever import OpenAlexRetriever
+from paper_agent.adapters.query_planner import HeuristicQueryPlanner
+from paper_agent.adapters.semantic_scholar_retriever import SemanticScholarRetriever
+from paper_agent.domain.models import PaperSource, ResearchIdea, SearchPlan, SearchQuery
+
+IDEA_ZH = "用强化学习提升小语言模型的数学推理能力"
+
+
+class ConceptExtractionTest(unittest.TestCase):
+    def test_chinese_idea_maps_to_english_terms(self):
+        extracted = HeuristicConceptExtractor().extract(IDEA_ZH)
+        self.assertIn("reinforcement learning", extracted.concepts)
+        self.assertIn("mathematical reasoning", extracted.concepts)
+        self.assertIn("small language model", extracted.concepts)
+
+    def test_longest_match_wins(self):
+        extracted = HeuristicConceptExtractor().extract("深度强化学习")
+        self.assertIn("deep reinforcement learning", extracted.concepts)
+        self.assertNotIn("reinforcement learning", extracted.concepts)
+
+    def test_english_idea_keeps_tokens_without_stopwords(self):
+        extracted = HeuristicConceptExtractor().extract(
+            "improving mathematical reasoning with self-training"
+        )
+        self.assertIn("mathematical", extracted.concepts)
+        self.assertNotIn("with", extracted.concepts)
+
+    def test_synonyms_follow_concepts(self):
+        extracted = HeuristicConceptExtractor().extract(IDEA_ZH)
+        self.assertTrue(set(extracted.synonyms) & {"RL", "policy optimization", "LLM"})
+
+
+class QueryPlannerTest(unittest.TestCase):
+    def setUp(self):
+        self.planner = HeuristicQueryPlanner()
+
+    def test_plan_has_one_query_per_source(self):
+        plan = asyncio.run(self.planner.plan(ResearchIdea(text=IDEA_ZH), 25))
+        sources = [q.source for q in plan.queries]
+        self.assertEqual(
+            set(sources), {PaperSource.ARXIV, PaperSource.OPENALEX, PaperSource.CROSSREF, PaperSource.SEMANTIC_SCHOLAR}
+        )
+        for q in plan.queries:
+            self.assertEqual(q.limit, 25)
+            self.assertTrue(q.query)
+
+    def test_required_terms_included_in_query(self):
+        idea = ResearchIdea(text=IDEA_ZH, required_terms=["curriculum learning"])
+        plan = asyncio.run(self.planner.plan(idea, 10))
+        for q in plan.queries:
+            self.assertIn("curriculum learning", q.query)
+
+    def test_inclusion_criteria_mention_required_terms(self):
+        idea = ResearchIdea(text=IDEA_ZH, required_terms=["GRPO"])
+        plan = asyncio.run(self.planner.plan(idea, 10))
+        self.assertTrue(any("GRPO" in c for c in plan.inclusion_criteria))
+
+    def test_excluded_terms_flow_into_exclusion(self):
+        idea = ResearchIdea(text=IDEA_ZH, excluded_terms=["survey"])
+        plan = asyncio.run(self.planner.plan(idea, 10))
+        self.assertIn("survey", plan.exclusion_criteria)
+
+
+class LLMConceptExtractorTest(unittest.TestCase):
+    def test_inactive_without_key_uses_heuristic(self):
+        with mock.patch.dict("os.environ", {}, clear=False):
+            extractor = LLMConceptExtractor(api_key=None)
+            extracted = extractor.extract(IDEA_ZH)
+            self.assertIn("reinforcement learning", extracted.concepts)
+            self.assertEqual(extractor.last_mode, "heuristic")
+
+    def test_llm_failure_degrades_to_heuristic(self):
+        extractor = LLMConceptExtractor(api_key="sk-test")
+        with mock.patch("paper_agent.adapters.llm_concept_extractor.requests.post") as post:
+            post.side_effect = requests.ConnectionError("down")
+            extracted = extractor.extract(IDEA_ZH)
+        self.assertIn("reinforcement learning", extracted.concepts)
+        self.assertEqual(extractor.last_mode, "heuristic")
+
+    def test_llm_success_parses_concepts(self):
+        extractor = LLMConceptExtractor(api_key="sk-test")
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {
+            "choices": [{"message": {"content": json.dumps({
+                "concepts": ["GRPO", "process reward model"],
+                "synonyms": ["RL"],
+            })}}]
+        }
+        with mock.patch("paper_agent.adapters.llm_concept_extractor.requests.post") as post:
+            post.return_value = response
+            extracted = extractor.extract(IDEA_ZH)
+        self.assertEqual(extracted.concepts, ["GRPO", "process reward model"])
+        self.assertEqual(extractor.last_mode, "llm")
+
+    def test_llm_garbage_json_degrades(self):
+        extractor = LLMConceptExtractor(api_key="sk-test")
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {"choices": [{"message": {"content": "no json here"}}]}
+        with mock.patch("paper_agent.adapters.llm_concept_extractor.requests.post") as post:
+            post.return_value = response
+            extracted = extractor.extract(IDEA_ZH)
+        self.assertEqual(extractor.last_mode, "heuristic")
+
+
+class HttpUtilTest(unittest.TestCase):
+    def test_timeout_raises_typed_error(self):
+        with mock.patch("paper_agent.adapters._retriever_utils.requests.get") as get:
+            get.side_effect = requests.Timeout("t")
+            with self.assertRaises(ProviderTimeoutError):
+                http_get_json("http://example.com")
+
+    def test_persistent_429_raises_rate_limited(self):
+        response = mock.Mock(status_code=429)
+        with mock.patch("paper_agent.adapters._retriever_utils.requests.get") as get:
+            get.return_value = response
+            with self.assertRaises(ProviderRateLimitedError):
+                http_get_json("http://example.com", max_retries=1)
+
+    def test_500_retries_then_raises_unavailable(self):
+        response = mock.Mock(status_code=500)
+        with mock.patch("paper_agent.adapters._retriever_utils.requests.get") as get:
+            get.return_value = response
+            with self.assertRaises(ProviderUnavailableError):
+                http_get_json("http://example.com", max_retries=1)
+
+    def test_invalid_json_raises_response_error(self):
+        response = mock.Mock(status_code=200)
+        response.json.side_effect = ValueError("bad")
+        with mock.patch("paper_agent.adapters._retriever_utils.requests.get") as get:
+            get.return_value = response
+            with self.assertRaises(ProviderResponseError):
+                http_get_json("http://example.com")
+
+    def test_normalize_doi_variants(self):
+        self.assertEqual(normalize_doi("https://doi.org/10.1234/abc"), "10.1234/abc")
+        self.assertEqual(normalize_doi("10.1234/abc"), "10.1234/abc")
+        self.assertIsNone(normalize_doi(None))
+
+    def test_parse_date_illegal_returns_none(self):
+        self.assertIsNone(parse_date("not-a-date"))
+        self.assertIsNone(parse_date(None))
+        self.assertEqual(parse_date("2024-03-01").year, 2024)
+
+    def test_parse_year_bounds(self):
+        self.assertIsNone(parse_year("garbage"))
+        self.assertIsNone(parse_year(1500))
+        self.assertIsNone(parse_year(2500))
+        self.assertEqual(parse_year("2024"), 2024)
+
+    def test_inverted_index_restoration(self):
+        restored = restore_abstract_from_inverted_index({"word": [0, 2], "next": [1]})
+        self.assertEqual(restored, "word next word")
+        self.assertIsNone(restore_abstract_from_inverted_index(None))
+
+
+CROSSREF_PAYLOAD = {
+    "message": {
+        "items": [
+            {
+                "DOI": "https://doi.org/10.1000/demo",
+                "title": ["Deep RL for Mathematical Reasoning"],
+                "author": [
+                    {"given": "Alex", "family": "Chen", "ORCID": "https://orcid.org/0000-0001-0000-0000",
+                     "affiliation": [{"name": "Example University"}]},
+                ],
+                "container-title": ["Journal of Demo"],
+                "issued": {"date-parts": [[2024, 5, 3]]},
+                "abstract": "<p>We study <i>reasoning</i>.</p>",
+                "is-referenced-by-count": 42,
+                "URL": "https://doi.org/10.1000/demo",
+                "type": "journal-article",
+            },
+            {
+                "DOI": "10.1000/empty",
+                "title": ["No authors, illegal date"],
+                "issued": {"date-parts": [["garbage"]]},
+            },
+        ]
+    }
+}
+
+OPENALEX_PAYLOAD = {
+    "results": [
+        {
+            "id": "https://openalex.org/W123",
+            "doi": "https://doi.org/10.1000/openalex",
+            "display_name": "Group Relative Policy Optimization",
+            "authorships": [
+                {"author": {"display_name": "Taylor Li", "orcid": "https://orcid.org/0000-0002-0000-0000"},
+                 "institutions": [{"display_name": "Demo Institute"}]},
+            ],
+            "publication_year": 2024,
+            "publication_date": "2024-02-01",
+            "primary_location": {"source": {"display_name": "arXiv"}},
+            "cited_by_count": 7,
+            "open_access": {"is_oa": True, "oa_url": "https://example.org/oa.pdf"},
+            "abstract_inverted_index": {"We": [0], "study": [1], "GRPO": [2]},
+        },
+        {
+            "id": "https://openalex.org/W456",
+            "display_name": "No abstract here",
+            "publication_year": 2023,
+        },
+    ]
+}
+
+S2_PAYLOAD = {
+    "data": [
+        {
+            "paperId": "abc123",
+            "title": "DAPO: An Open-Source System",
+            "abstract": "We open source everything.",
+            "year": 2025,
+            "publicationDate": "2025-03-10",
+            "authors": [{"name": "Robin Zhang"}, {"name": ""}],
+            "venue": "NeurIPS",
+            "externalIds": {"DOI": "10.1000/dapo", "ArXiv": "2503.14476"},
+            "citationCount": 3,
+            "openAccessPdf": {"url": "https://example.org/dapo.pdf"},
+        },
+        {"paperId": "def456", "title": "", "year": 2024},
+    ]
+}
+
+
+def _plan_for(source: PaperSource) -> SearchPlan:
+    return SearchPlan(
+        intent_summary="demo",
+        queries=[SearchQuery(source=source, query="reinforcement learning reasoning", limit=5)],
+    )
+
+
+class RetrieverMappingTest(unittest.TestCase):
+    def test_crossref_maps_fields_and_strips_jats(self):
+        retriever = CrossrefRetriever()
+        papers = retriever._to_papers(CROSSREF_PAYLOAD)
+        self.assertEqual(len(papers), 2)
+        first = papers[0]
+        self.assertEqual(first.title, "Deep RL for Mathematical Reasoning")
+        self.assertEqual(first.doi, "10.1000/demo")
+        self.assertEqual(first.authors[0].name, "Alex Chen")
+        self.assertIn("Example University", first.institutions)
+        self.assertEqual(first.year, 2024)
+        self.assertEqual(first.abstract, "We study reasoning .")
+        self.assertEqual(first.citation_count, 42)
+        self.assertIn("@article{", first.bibtex)
+        self.assertEqual(first.source_records[0].source, PaperSource.CROSSREF)
+
+    def test_crossref_illegal_date_becomes_none_not_crash(self):
+        retriever = CrossrefRetriever()
+        second = retriever._to_papers(CROSSREF_PAYLOAD)[1]
+        self.assertIsNone(second.publication_date)
+
+    def test_openalex_restores_inverted_abstract(self):
+        retriever = OpenAlexRetriever()
+        papers = retriever._to_papers(OPENALEX_PAYLOAD)
+        self.assertEqual(len(papers), 2)
+        first = papers[0]
+        self.assertEqual(first.abstract, "We study GRPO")
+        self.assertEqual(first.openalex_id, "W123")
+        self.assertTrue(first.is_open_access)
+        self.assertEqual(first.authors[0].orcid, "0000-0002-0000-0000")
+        second = papers[1]
+        self.assertIsNone(second.abstract)
+
+    def test_semantic_scholar_maps_external_ids(self):
+        retriever = SemanticScholarRetriever()
+        papers = retriever._to_papers(S2_PAYLOAD)
+        self.assertEqual(len(papers), 1)
+        first = papers[0]
+        self.assertEqual(first.title, "DAPO: An Open-Source System")
+        self.assertEqual(first.doi, "10.1000/dapo")
+        self.assertEqual(first.arxiv_id, "2503.14476")
+        self.assertEqual(first.semantic_scholar_id, "abc123")
+        self.assertEqual(first.venue.name, "NeurIPS")
+        self.assertIn("Robin Zhang", [a.name for a in first.authors])
+
+    def test_retriever_returns_empty_when_plan_lacks_its_source(self):
+        for retriever in (CrossrefRetriever(), OpenAlexRetriever(), SemanticScholarRetriever()):
+            plan = _plan_for(PaperSource.ARXIV)
+            self.assertEqual(asyncio.run(retriever.search(plan)), [])
+
+    def test_search_empty_payload_returns_empty_list(self):
+        retriever = CrossrefRetriever()
+        with mock.patch("paper_agent.adapters._retriever_utils.requests.get") as get:
+            get.return_value = mock.Mock(status_code=404)
+            plan = _plan_for(PaperSource.CROSSREF)
+            result = asyncio.run(retriever.search(plan))
+        self.assertEqual(result, [])
+
+    def test_search_provider_error_propagates_typed(self):
+        retriever = OpenAlexRetriever()
+        with mock.patch("paper_agent.adapters._retriever_utils.requests.get") as get:
+            get.side_effect = requests.Timeout("t")
+            plan = _plan_for(PaperSource.OPENALEX)
+            with self.assertRaises(ProviderTimeoutError):
+                asyncio.run(retriever.search(plan))
+
+
+if __name__ == "__main__":
+    unittest.main()

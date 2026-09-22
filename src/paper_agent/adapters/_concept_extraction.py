@@ -1,0 +1,127 @@
+"""Concept extraction: turn a one-sentence research idea into searchable terms.
+
+This module holds the heuristic (offline, deterministic) extractor. It is the
+default for ``HeuristicQueryPlanner`` and doubles as the fallback for the
+optional LLM extractor, mirroring the degrade-on-failure pattern used in
+LLM-assisted ingestion pipelines.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+
+# Chinese -> English academic terms. Longest match wins ("数学推理" beats "推理").
+_ZH_EN_TERMS: dict[str, str] = {
+    "深度强化学习": "deep reinforcement learning",
+    "强化学习": "reinforcement learning",
+    "数学推理": "mathematical reasoning",
+    "推理能力": "reasoning",
+    "大语言模型": "large language model",
+    "大型语言模型": "large language model",
+    "语言模型": "language model",
+    "小语言模型": "small language model",
+    "小模型": "small language model",
+    "多智能体": "multi-agent",
+    "智能体": "agent",
+    "检索增强": "retrieval augmented generation",
+    "知识图谱": "knowledge graph",
+    "文本分类": "text classification",
+    "情感分析": "sentiment analysis",
+    "机器翻译": "machine translation",
+    "代码生成": "code generation",
+    "图像生成": "image generation",
+    "指令微调": "instruction tuning",
+    "微调": "fine-tuning",
+    "人类反馈": "human feedback",
+    "奖励模型": "reward model",
+    "对齐": "alignment",
+    "幻觉": "hallucination",
+    "可解释性": "interpretability",
+    "联邦学习": "federated learning",
+    "对比学习": "contrastive learning",
+    "提示学习": "prompt learning",
+    "思维链": "chain of thought",
+    "摘要": "summarization",
+    "问答": "question answering",
+    "推荐系统": "recommendation system",
+    "异常检测": "anomaly detection",
+    "时间序列": "time series",
+}
+
+_SYNONYM_GROUPS: list[list[str]] = [
+    ["reinforcement learning", "RL", "policy optimization"],
+    ["mathematical reasoning", "math reasoning"],
+    ["large language model", "LLM"],
+    ["chain of thought", "CoT"],
+    ["retrieval augmented generation", "RAG"],
+    ["fine-tuning", "instruction tuning"],
+    ["multi-agent", "agent collaboration"],
+]
+
+_STOPWORDS = {
+    "the", "a", "an", "of", "for", "in", "on", "with", "and", "or", "to",
+    "how", "improve", "improving", "using", "use", "based", "via", "towards",
+    "toward", "study", "research", "method", "methods", "approach", "利用",
+    "提升", "提高", "研究", "基于", "通过", "如何", "什么",
+}
+
+_TOKEN_RE = re.compile(r"[a-zA-Z]{2,}")
+
+
+@dataclass
+class ExtractedConcepts:
+    """Normalized, provider-agnostic concept set shared by planners."""
+
+    concepts: list[str] = field(default_factory=list)
+    synonyms: list[str] = field(default_factory=list)
+
+    def join(self) -> str:
+        return " ".join(self.concepts)
+
+
+def _synonyms_for(concepts: list[str]) -> list[str]:
+    """Synonyms from any group sharing a word with an extracted concept."""
+    synonyms: list[str] = []
+    for group in _SYNONYM_GROUPS:
+        for term in group:
+            if term in concepts:
+                synonyms.extend(t for t in group if t != term)
+                break
+    seen: set[str] = set()
+    return [s for s in synonyms if not (s in seen or seen.add(s))]
+
+
+class HeuristicConceptExtractor:
+    """Offline rule-based extractor: zh-lexicon mapping + token filtering."""
+
+    def extract(self, text: str) -> ExtractedConcepts:
+        concepts: list[str] = []
+
+        spans: list[tuple[int, int, str]] = []
+        for zh, en in _ZH_EN_TERMS.items():
+            start = 0
+            while (idx := text.find(zh, start)) != -1:
+                spans.append((idx, idx + len(zh), en))
+                start = idx + len(zh)
+        # Longest matches first; skip spans overlapped by a strictly longer one.
+        for start, end, en in sorted(spans, key=lambda s: s[1] - s[0], reverse=True):
+            if en in concepts:
+                continue
+            overlapped = any(
+                not (end <= s or start >= e) and (e - s) > (end - start)
+                for s, e, _ in spans
+            )
+            if overlapped:
+                continue
+            concepts.append(en)
+
+        for token in _TOKEN_RE.findall(text):
+            lower = token.lower()
+            if lower in _STOPWORDS:
+                continue
+            if not any(lower in c.split() for c in concepts):
+                concepts.append(lower)
+
+        concepts = concepts[:8]
+        return ExtractedConcepts(concepts=concepts, synonyms=_synonyms_for(concepts))
