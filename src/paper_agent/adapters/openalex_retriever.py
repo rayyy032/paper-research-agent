@@ -124,7 +124,7 @@ class OpenAlexRetriever:
             venue=Venue(name=venue_name) if venue_name else None,
             citation_count=item.get("cited_by_count"),
             is_open_access=oa.get("is_oa"),
-            open_access_url=oa.get("oa_url"),
+            open_access_url=(oa.get("oa_url") or None),
             bibtex=bibtex,
             landing_page_url=landing_page,
             source_records=[

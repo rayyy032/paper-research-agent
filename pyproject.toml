@@ -8,10 +8,12 @@ dependencies = [
   "mcp[cli]>=2.0,<3",
   "pydantic>=2.8,<3",
   "streamlit>=1.40,<2",
+  "arxiv>=2.4,<3",
+  "bibtexparser>=1.4,<2",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.8", "mypy>=1.13"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.8", "mypy>=1.13"]
 
 [project.scripts]
 paper-agent-mcp = "paper_agent.mcp_server:main"

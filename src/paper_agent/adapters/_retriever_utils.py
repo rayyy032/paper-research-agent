@@ -12,9 +12,9 @@ Conventions from docs/API_CONTRACTS.md:
 
 from __future__ import annotations
 
-import asyncio
 import time
-from datetime import date
+from datetime import UTC, date, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import quote
 
@@ -41,6 +41,33 @@ class ProviderResponseError(ProviderError):
     """The provider answered but the payload could not be trusted."""
 
 
+_RETRY_AFTER_CAP_SECONDS = 120.0
+
+
+def _retry_after(response: Any, fallback: float) -> float:
+    """Respect the provider's Retry-After header (seconds or HTTP-date).
+
+    Falls back to the caller's exponential backoff when absent/unparsable and
+    caps the wait so one stubborn provider cannot stall the whole pipeline.
+    """
+    headers = getattr(response, "headers", None) or {}
+    getter = getattr(headers, "get", None)
+    if getter is None:
+        return fallback
+    value = getter("Retry-After")
+    if not value:
+        return fallback
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        try:
+            when = parsedate_to_datetime(str(value))
+        except (TypeError, ValueError):
+            return fallback
+        seconds = (when - datetime.now(UTC)).total_seconds()
+    return max(0.0, min(seconds, _RETRY_AFTER_CAP_SECONDS))
+
+
 def http_get_json(
     url: str,
     *,
@@ -48,22 +75,22 @@ def http_get_json(
     headers: dict[str, str] | None = None,
     timeout: float = 20.0,
     max_retries: int = 3,
+    initial_backoff: float = 0.5,
 ) -> Any:
     """Blocking GET returning parsed JSON with retry/backoff.
 
-    Retries 429 and 5xx with exponential backoff (0.5s, 1s, 2s). A 429 that
+    Retries 429 and 5xx with exponential backoff (default 0.5s, 1s, 2s). A 429
+    honors the provider's ``Retry-After`` header when present. A 429 that
     persists after all retries raises ``ProviderRateLimitedError``; connection
     problems raise ``ProviderUnavailableError``.
     """
-    backoff = 0.5
-    last_error: Exception | None = None
+    backoff = initial_backoff
     for attempt in range(max_retries + 1):
         try:
             response = requests.get(url, params=params, headers=headers, timeout=timeout)
         except requests.Timeout as exc:
             raise ProviderTimeoutError(f"{url} timed out after {timeout}s") from exc
         except requests.RequestException as exc:
-            last_error = exc
             if attempt < max_retries:
                 time.sleep(backoff)
                 backoff *= 2
@@ -78,7 +105,7 @@ def http_get_json(
 
         if response.status_code == 429:
             if attempt < max_retries:
-                time.sleep(backoff)
+                time.sleep(_retry_after(response, fallback=backoff))
                 backoff *= 2
                 continue
             raise ProviderRateLimitedError(f"{url} rate limited after {max_retries} retries")

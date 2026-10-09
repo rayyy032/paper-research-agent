@@ -3,23 +3,66 @@
 Group implementations are wired here and nowhere else. During parallel work,
 each group can replace one adapter without changing the pipeline, MCP server,
 or Streamlit page.
+
+Assembly modes (``PAPER_AGENT_ENV``):
+- ``demo`` (default): offline demo components, unchanged team baseline.
+- ``retrieval``: retrieval group (A + B) production components for the
+  retrieval segment — real query planner, four live sources (arXiv,
+  Crossref, OpenAlex, Semantic Scholar) and the real merger. All later
+  stages (ranking, full text, summarization, report) stay demo until
+  groups 2 and 3 deliver their adapters.
 """
 
+from __future__ import annotations
+
+from dataclasses import replace
+
 from paper_agent.adapters import build_demo_dependencies
+from paper_agent.adapters.arxiv_retriever import ArxivRetriever, ArxivSearchConfig
+from paper_agent.adapters.crossref_retriever import CrossrefRetriever
+from paper_agent.adapters.openalex_retriever import OpenAlexRetriever
+from paper_agent.adapters.paper_merger import PaperMerger
+from paper_agent.adapters.query_planner import HeuristicQueryPlanner
+from paper_agent.adapters.semantic_scholar_retriever import SemanticScholarRetriever
 from paper_agent.application.agent import PaperResearchAgent
-from paper_agent.application.pipeline import ResearchPipeline
+from paper_agent.application.pipeline import PipelineDependencies, ResearchPipeline
 from paper_agent.config import Settings
+
+
+def build_retrieval_dependencies() -> PipelineDependencies:
+    """Retrieval segment (group 1, sides A + B) production assembly.
+
+    Real planner/retrievers/merger are swapped into the shared dependency
+    graph; components owned by other groups are taken from the demo assembly
+    and must be replaced by their owners later.
+    """
+    demo = build_demo_dependencies()
+    return replace(
+        demo,
+        query_planner=HeuristicQueryPlanner(),
+        retrievers=[
+            ArxivRetriever(config=ArxivSearchConfig(max_retries=2)),
+            CrossrefRetriever(),
+            OpenAlexRetriever(),
+            SemanticScholarRetriever(),
+        ],
+        merger=PaperMerger(),
+    )
 
 
 def build_agent(settings: Settings | None = None) -> PaperResearchAgent:
     settings = settings or Settings.from_env()
-    if settings.app_env != "demo":
+    if settings.app_env == "demo":
+        deps = build_demo_dependencies()
+    elif settings.app_env == "retrieval":
+        deps = build_retrieval_dependencies()
+    else:
         raise RuntimeError(
             "Production adapters are not implemented yet. Complete group 1-3 adapters "
             "and replace this branch in paper_agent.bootstrap.build_agent()."
         )
     pipeline = ResearchPipeline(
-        build_demo_dependencies(), max_concurrency=settings.max_concurrency
+        deps, max_concurrency=settings.max_concurrency
     )
     return PaperResearchAgent(pipeline)
 

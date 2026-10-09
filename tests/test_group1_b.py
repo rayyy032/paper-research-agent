@@ -8,6 +8,7 @@ missing, illegal dates, rate limits, timeouts.
 import asyncio
 import json
 import unittest
+from datetime import UTC, datetime, timedelta
 from unittest import mock
 
 import requests
@@ -24,7 +25,7 @@ from paper_agent.adapters._retriever_utils import (
     parse_year,
     restore_abstract_from_inverted_index,
 )
-from paper_agent.adapters.crossref_retriever import CrossrefRetriever, _strip_jats
+from paper_agent.adapters.crossref_retriever import CrossrefRetriever
 from paper_agent.adapters.llm_concept_extractor import LLMConceptExtractor
 from paper_agent.adapters.openalex_retriever import OpenAlexRetriever
 from paper_agent.adapters.query_planner import HeuristicQueryPlanner
@@ -57,6 +58,11 @@ class ConceptExtractionTest(unittest.TestCase):
         extracted = HeuristicConceptExtractor().extract(IDEA_ZH)
         self.assertTrue(set(extracted.synonyms) & {"RL", "policy optimization", "LLM"})
 
+    def test_subsumed_concepts_are_dropped(self):
+        extracted = HeuristicConceptExtractor().extract(IDEA_ZH)
+        self.assertIn("mathematical reasoning", extracted.concepts)
+        self.assertNotIn("reasoning", extracted.concepts)
+
 
 class QueryPlannerTest(unittest.TestCase):
     def setUp(self):
@@ -87,6 +93,21 @@ class QueryPlannerTest(unittest.TestCase):
         idea = ResearchIdea(text=IDEA_ZH, excluded_terms=["survey"])
         plan = asyncio.run(self.planner.plan(idea, 10))
         self.assertIn("survey", plan.exclusion_criteria)
+
+    def test_filters_follow_shared_retrieval_protocol(self):
+        idea = ResearchIdea(text=IDEA_ZH, excluded_terms=["survey"])
+        plan = asyncio.run(self.planner.plan(idea, 10))
+        for q in plan.queries:
+            self.assertEqual(q.filters.get("excluded_terms"), ["survey"])
+            self.assertNotIn("synonyms", q.filters)
+            self.assertLessEqual(
+                set(q.filters), {"date_from", "date_to", "excluded_terms", "required_terms"}
+            )
+
+    def test_no_filters_when_no_exclusions(self):
+        plan = asyncio.run(self.planner.plan(ResearchIdea(text=IDEA_ZH), 10))
+        for q in plan.queries:
+            self.assertEqual(q.filters, {})
 
 
 class LLMConceptExtractorTest(unittest.TestCase):
@@ -126,7 +147,7 @@ class LLMConceptExtractorTest(unittest.TestCase):
         response.json.return_value = {"choices": [{"message": {"content": "no json here"}}]}
         with mock.patch("paper_agent.adapters.llm_concept_extractor.requests.post") as post:
             post.return_value = response
-            extracted = extractor.extract(IDEA_ZH)
+            extractor.extract(IDEA_ZH)
         self.assertEqual(extractor.last_mode, "heuristic")
 
 
@@ -143,6 +164,31 @@ class HttpUtilTest(unittest.TestCase):
             get.return_value = response
             with self.assertRaises(ProviderRateLimitedError):
                 http_get_json("http://example.com", max_retries=1)
+
+    def test_retry_after_seconds_header_is_honored(self):
+        limited = mock.Mock(status_code=429, headers={"Retry-After": "7"})
+        ok = mock.Mock(status_code=200)
+        ok.json.return_value = {"data": []}
+        with mock.patch("paper_agent.adapters._retriever_utils.requests.get") as get:
+            get.side_effect = [limited, ok]
+            with mock.patch("paper_agent.adapters._retriever_utils.time.sleep") as sleep:
+                result = http_get_json("http://example.com", max_retries=2)
+        self.assertEqual(result, {"data": []})
+        sleep.assert_called_once_with(7.0)
+
+    def test_retry_after_http_date_is_honored(self):
+        future = datetime.now(UTC) + timedelta(minutes=2)
+        http_date = future.strftime("%a, %d %b %Y %H:%M:%S GMT")
+        limited = mock.Mock(status_code=429, headers={"Retry-After": http_date})
+        ok = mock.Mock(status_code=200)
+        ok.json.return_value = {}
+        with mock.patch("paper_agent.adapters._retriever_utils.requests.get") as get:
+            get.side_effect = [limited, ok]
+            with mock.patch("paper_agent.adapters._retriever_utils.time.sleep") as sleep:
+                http_get_json("http://example.com", max_retries=2)
+        waited = sleep.call_args[0][0]
+        self.assertGreater(waited, 60)
+        self.assertLessEqual(waited, 120)
 
     def test_500_retries_then_raises_unavailable(self):
         response = mock.Mock(status_code=500)
@@ -302,6 +348,32 @@ class RetrieverMappingTest(unittest.TestCase):
         self.assertEqual(first.semantic_scholar_id, "abc123")
         self.assertEqual(first.venue.name, "NeurIPS")
         self.assertIn("Robin Zhang", [a.name for a in first.authors])
+
+    def test_semantic_scholar_empty_pdf_url_becomes_none(self):
+        # Real S2 records can carry openAccessPdf with an empty url string;
+        # the contract requires None instead of "" (URL validation fails).
+        retriever = SemanticScholarRetriever()
+        payload = {"data": [{
+            "paperId": "xyz789",
+            "title": "Empty OA URL Record",
+            "year": 2024,
+            "authors": [{"name": "Taylor Li"}],
+            "openAccessPdf": {"url": ""},
+        }]}
+        paper = retriever._to_papers(payload)[0]
+        self.assertIsNone(paper.open_access_url)
+        self.assertFalse(paper.is_open_access)
+
+    def test_openalex_empty_oa_url_becomes_none(self):
+        retriever = OpenAlexRetriever()
+        payload = {"results": [{
+            "id": "https://openalex.org/W789",
+            "display_name": "Empty OA URL Record",
+            "publication_year": 2024,
+            "open_access": {"is_oa": True, "oa_url": ""},
+        }]}
+        paper = retriever._to_papers(payload)[0]
+        self.assertIsNone(paper.open_access_url)
 
     def test_retriever_returns_empty_when_plan_lacks_its_source(self):
         for retriever in (CrossrefRetriever(), OpenAlexRetriever(), SemanticScholarRetriever()):

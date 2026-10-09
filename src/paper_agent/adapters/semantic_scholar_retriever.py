@@ -44,6 +44,8 @@ class SemanticScholarRetriever:
 
     def _fetch(self, raw_query: str, limit: int) -> Any:
         headers = {"x-api-key": self.api_key} if self.api_key else None
+        # Public pool is strict (shared ~100 req/5min): start with a longer
+        # backoff and keep retrying while honoring the Retry-After header.
         return http_get_json(
             _API_URL,
             params={
@@ -53,6 +55,8 @@ class SemanticScholarRetriever:
             },
             headers=headers,
             timeout=self.timeout,
+            max_retries=4,
+            initial_backoff=2.0,
         )
 
     def _to_papers(self, payload: Any) -> list[Paper]:
@@ -85,7 +89,9 @@ class SemanticScholarRetriever:
         arxiv_id = external.get("ArXiv")
         paper_id = item.get("paperId")
         venue_name = (item.get("venue") or "").strip() or None
-        open_access_pdf = (item.get("openAccessPdf") or {}).get("url")
+        # Some records carry openAccessPdf with an empty url: contract says
+        # unknown/empty scalars become None, never "" (URL validation would fail).
+        open_access_pdf = (item.get("openAccessPdf") or {}).get("url") or None
         url = f"https://www.semanticscholar.org/paper/{paper_id}" if paper_id else None
 
         bibtex = build_bibtex(

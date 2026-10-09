@@ -123,5 +123,13 @@ class HeuristicConceptExtractor:
             if not any(lower in c.split() for c in concepts):
                 concepts.append(lower)
 
+        # Drop concepts whose every word already appears in a longer concept
+        # (e.g. "reasoning" after "mathematical reasoning"), then cap the list.
+        concepts = [
+            c for c in concepts
+            if not any(
+                o != c and all(w in o.split() for w in c.split()) for o in concepts
+            )
+        ]
         concepts = concepts[:8]
         return ExtractedConcepts(concepts=concepts, synonyms=_synonyms_for(concepts))

@@ -57,12 +57,18 @@ class HeuristicQueryPlanner:
 
         synonyms = list(extracted.synonyms)
         base_query = " ".join(concepts)
+        # Filter keys follow the retrieval group's shared protocol
+        # (see ArxivRetriever): only date_from/date_to/excluded_terms/
+        # required_terms are recognized. Synonyms live on the plan itself.
+        filters: dict[str, list[str]] = {}
+        if idea.excluded_terms:
+            filters["excluded_terms"] = list(idea.excluded_terms)
         queries = [
             SearchQuery(
                 source=source,
                 query=base_query,
                 limit=limit_per_source,
-                filters={"synonyms": synonyms},
+                filters=filters,
             )
             for source in _PLANNED_SOURCES
         ]
